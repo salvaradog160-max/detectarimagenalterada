@@ -17,7 +17,7 @@ from skimage.util import img_as_float
 # ─────────────────────────────────────────
 # CONFIGURACIÓN
 # ─────────────────────────────────────────
-TOKEN = os.environ.get("TELEGRAM_TOKEN", "TU_TOKEN_AQUI")
+TOKEN = os.environ.get("TELEGRAM_TOKEN", "8699029540:AAE9TGMSC5fvW2Fldhuc_keYQAYxM_ooW_s")
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
