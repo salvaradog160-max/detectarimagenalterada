@@ -4,3 +4,4 @@ numpy
 flask
 opencv-python-headless
 scikit-image
+scipy
