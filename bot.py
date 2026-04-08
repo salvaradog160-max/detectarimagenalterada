@@ -13,10 +13,12 @@ TOKEN = "8699029540:AAE9TGMSC5fvW2Fldhuc_keYQAYxM_ooW_s"
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
-# --- WEB SERVER FALSO PARA RENDER ---
+# --- WEB SERVER FALSO PARA RENDER (Mantiene el servicio vivo) ---
 web_app = Flask(__name__)
 @web_app.route('/')
-def health_check(): return "Validador Vivo", 200
+def health_check(): 
+    return "Validador Vivo", 200
+
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
     web_app.run(host='0.0.0.0', port=port)
@@ -34,34 +36,34 @@ def analyze_image(image_path):
     diff_textura = cv2.morphologyEx(thr, cv2.MORPH_OPEN, kernel)
     noise_score = np.mean(diff_textura) # Un score alto indica muchas zonas lisas/parches
 
-    # 3. Bordes Canny (Ya lo teníamos, es bueno para texto nítido)
+    # 3. Bordes Canny (Detecta texto con nitidez artificial)
     edges = cv2.Canny(img_cv, 100, 200)
     edge_score = np.mean(edges)
 
     return noise_score, edge_score
 
 def generate_dictamen(noise_score, edge_score):
-    # Umbrales empíricos (ajustar según pruebas)
-    NOISE_THRESHOLD_HIGH = 15.0 # Sensibilidad para detectar parches lisos
-    EDGE_THRESHOLD_HIGH = 10.0
+    # --- UMBRALES CALIBRADOS (Subidos para evitar falsos positivos) ---
+    NOISE_THRESHOLD_HIGH = 25.0 # Antes 15.0
+    EDGE_THRESHOLD_HIGH = 18.0  # Antes 10.0
     
     risk_points = 0
     detalles = []
 
-    # Detección de parches digitales (lisos)
+    # Detección de parches digitales (Zonas demasiado lisas)
     if noise_score > NOISE_THRESHOLD_HIGH:
         risk_points += 3
-        detalles.append("- 🔴 **PARCHE DETECTADO**: Se detectaron zonas sospechosamente lisas en el documento (típico de montos sobrepuestos digitales).")
-    elif noise_score > 8.0:
+        detalles.append("- 🔴 **ANOMALÍA DE TEXTURA**: Se detectaron zonas artificialmente lisas (posible parche digital).")
+    elif noise_score > 15.0:
         risk_points += 1
-        detalles.append("- 🟡 Textura del papel inconsistente.")
+        detalles.append("- 🟡 Textura del papel ligeramente inconsistente.")
 
-    # Bordes sospechosos (Texto demasiado nítido)
+    # Bordes sospechosos (Texto demasiado perfecto)
     if edge_score > EDGE_THRESHOLD_HIGH:
         risk_points += 2
-        detalles.append("- 🔴 Letras o números demasiado nítidos para ser una foto real.")
+        detalles.append("- 🔴 **NITIDEZ EXTREMA**: Los bordes del texto son demasiado perfectos para una foto física (posible texto insertado).")
 
-    # Veredicto
+    # Veredicto final
     if risk_points >= 3:
         return "🔴 **RIESGO CRÍTICO DETECTADO**", "\n".join(detalles)
     elif risk_points >= 1:
@@ -77,13 +79,13 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await file.download_to_drive(input_path)
         await update.message.reply_text("🔍 Iniciando análisis forense avanzado de textura y bordes...")
 
-        # Ejecutar análisis
+        # Ejecutar análisis matemático
         noise_score, edge_score = analyze_image(input_path)
         
-        # Generar Dictamen
+        # Generar el dictamen tipo semáforo
         titulo, detalles = generate_dictamen(noise_score, edge_score)
         
-        # Enviar Dictamen formateado
+        # Formatear el mensaje de respuesta para los economistas
         mensaje_final = (
             f"📊 **DICTAMEN DE INTEGRIDAD**\n"
             f"---------------------------------\n"
@@ -98,10 +100,16 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logging.error(f"Error: {e}")
         await update.message.reply_text("❌ Ocurrió un error durante el análisis.")
     finally:
+        # Limpieza de archivos temporales
         if os.path.exists(input_path): os.remove(input_path)
 
 if __name__ == '__main__':
+    # Ejecutar el servidor web en un hilo secundario
     threading.Thread(target=run_flask, daemon=True).start()
+    
+    # Configurar e iniciar el Bot de Telegram
     app = ApplicationBuilder().token(TOKEN).build()
     app.add_handler(MessageHandler(filters.PHOTO, handle_image))
+    
+    print("Bot con umbrales actualizados escuchando...")
     app.run_polling()
