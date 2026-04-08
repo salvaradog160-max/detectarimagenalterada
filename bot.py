@@ -9,7 +9,7 @@ import piexif
 from flask import Flask
 from telegram import Update, constants
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters
-from PIL import Image, ImageChops, ImageStat
+from PIL import Image, ImageChops, ImageEnhance, ImageStat
 
 # --- CONFIGURACIÓN ---
 TOKEN = "8699029540:AAE9TGMSC5fvW2Fldhuc_keYQAYxM_ooW_s"
@@ -17,10 +17,11 @@ logging.basicConfig(level=logging.INFO)
 
 web_app = Flask(__name__)
 @web_app.route("/")
-def health(): return "Analizador Forense 4.8 Activo ✅", 200
+def health(): return "Analizador Forense 4.9 Activo ✅", 200
 
 def run_flask():
-    web_app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+    port = int(os.environ.get("PORT", 10000))
+    web_app.run(host="0.0.0.0", port=port)
 
 # ═══════════════════════════════════════════════════════════════
 # MÓDULOS DE ANÁLISIS
@@ -32,8 +33,17 @@ def get_ela(image_path):
     original.save(buf, format='JPEG', quality=90)
     recompressed = Image.open(io.BytesIO(buf.getvalue()))
     ela_diff = ImageChops.difference(original, recompressed)
+    
+    # Calcular Score
     stat = ImageStat.Stat(ela_diff)
-    return float(sum(stat.mean) / 3), ela_diff
+    score = float(sum(stat.mean) / 3)
+    
+    # Brillo Dinámico para que NO salga negro
+    extrema = ela_diff.getextrema()
+    max_diff = max([ex[1] for ex in extrema]) or 1
+    ela_final = ImageEnhance.Brightness(ela_diff).enhance(255.0 / max_diff)
+    
+    return score, ela_final
 
 def get_noise_cv(image_path):
     img = cv2.imread(image_path, 0)
@@ -53,7 +63,7 @@ def get_exif(image_path):
         else:
             hallazgos.append("✅ Sin software de edición en metadatos.")
     except:
-        hallazgos.append("🟡 Sin metadatos EXIF (posible screenshot o procesada)")
+        hallazgos.append("🟡 Sin metadatos EXIF (posible screenshot)")
         puntos += 1
     return puntos, hallazgos
 
@@ -75,11 +85,12 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
         noise_cv = get_noise_cv(in_p)
         exif_pts, exif_h = get_exif(in_p)
         
-        # Guardar imagen ELA para mostrar
+        # Guardar y enviar imagen ELA
         ela_img.save(ela_p)
-        await update.message.reply_photo(photo=open(ela_p, "rb"), caption="🖼️ Mapa ELA (Compresión)")
+        with open(ela_p, "rb") as photo:
+            await update.message.reply_photo(photo=photo, caption="🖼️ Mapa ELA (Compresión)")
 
-        # Lógica de Scoring para el Dictamen
+        # Lógica de Scoring
         risk = 0.0
         detalles = []
         
@@ -98,7 +109,7 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
         risk = min(risk + exif_pts, 10.0)
         
         # Veredicto
-        if risk >= 6.0: titulo = "🔴 RIESGO ALTO — Probable falsificación"
+        if risk >= 6.0: titulo = "🔴 RIESGO ALTO — Probable Alteración"
         elif risk >= 3.0: titulo = "🟡 RIESGO MODERADO — Revisión humana"
         else: titulo = "🟢 CONFIABLE — Sin anomalías"
 
@@ -108,21 +119,21 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📊 *DICTAMEN FORENSE DIGITAL*\n"
             f"{'─' * 32}\n\n"
             f"*Veredicto:* {titulo}\n"
-            f"*Riesgo:* `[{barra}]` {risk:.1/10}\n"
+            f"*Riesgo:* `[{barra}]` {risk:.1f}/10\n"
             f"_Análisis por micro-textura y metadatos._\n\n"
             f"*Análisis Detallado:*\n"
             f"{chr(10).join(detalles)}\n\n"
             f"*📋 Metadatos EXIF:*\n"
             f"{chr(10).join(['  ' + h for h in exif_h])}\n\n"
             f"{'─' * 32}\n"
-            f"⚠️ _Este análisis es orientativo. El criterio humano es indispensable._"
+            f"⚠️ _Este análisis es una herramienta de apoyo, no sustituye el ojo humano ni el criterio del analista._"
         )
         
         await update.message.reply_text(reporte, parse_mode=constants.ParseMode.MARKDOWN)
 
     except Exception as e:
         logging.error(f"Error: {e}")
-        await update.message.reply_text("❌ Error al procesar.")
+        await update.message.reply_text(f"❌ Error al procesar: {str(e)}")
     finally:
         for p in [in_p, ela_p]:
             if os.path.exists(p): os.remove(p)
