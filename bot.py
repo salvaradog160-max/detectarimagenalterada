@@ -5,10 +5,11 @@ import threading
 import numpy as np
 import cv2
 import uuid
+import piexif
 from flask import Flask
 from telegram import Update, constants
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters
-from PIL import Image, ImageChops
+from PIL import Image, ImageChops, ImageStat
 
 # --- CONFIGURACIÓN ---
 TOKEN = "8699029540:AAE9TGMSC5fvW2Fldhuc_keYQAYxM_ooW_s"
@@ -16,111 +17,115 @@ logging.basicConfig(level=logging.INFO)
 
 web_app = Flask(__name__)
 @web_app.route("/")
-def health(): return "Analizador Forense 4.7 Activo ✅", 200
+def health(): return "Analizador Forense 4.8 Activo ✅", 200
 
 def run_flask():
-    port = int(os.environ.get("PORT", 10000))
-    web_app.run(host="0.0.0.0", port=port)
+    web_app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
 
 # ═══════════════════════════════════════════════════════════════
-# MOTOR DE ANÁLISIS (Detección de Parches y Ruido)
+# MÓDULOS DE ANÁLISIS
 # ═══════════════════════════════════════════════════════════════
-def perform_analysis(image_path):
-    img_cv = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
-    if img_cv is None: return None, False, 0, 0
-    
-    # 1. Medición de Ruido (Laplacian)
-    laplacian = cv2.Laplacian(img_cv, cv2.CV_64F)
-    score_ruido = float(np.var(laplacian))
-    
-    # 2. Análisis ELA (Compresión)
-    original = Image.open(image_path).convert("RGB")
+
+def get_ela(image_path):
+    original = Image.open(image_path).convert('RGB')
     buf = io.BytesIO()
-    original.save(buf, format="JPEG", quality=90)
+    original.save(buf, format='JPEG', quality=90)
     recompressed = Image.open(io.BytesIO(buf.getvalue()))
     ela_diff = ImageChops.difference(original, recompressed)
-    score_ela = float(np.array(ela_diff).mean())
+    stat = ImageStat.Stat(ela_diff)
+    return float(sum(stat.mean) / 3), ela_diff
 
-    # 3. Detector de Parches Visuales
-    img_result = cv2.imread(image_path)
-    blur = cv2.GaussianBlur(img_cv, (5,5), 0)
-    diff_local = cv2.absdiff(img_cv, blur)
-    _, mask = cv2.threshold(diff_local, 25, 255, cv2.THRESH_BINARY)
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    
-    parche_detectado = False
-    for cnt in contours:
-        area = cv2.contourArea(cnt)
-        x, y, w, h = cv2.boundingRect(cnt)
-        ratio = float(w)/h
-        # Filtro para detectar rectángulos de texto alterado
-        if 400 < area < 8000 and 1.1 < ratio < 10.0:
-            cv2.rectangle(img_result, (x, y), (x+w, y+h), (0, 0, 255), 3)
-            parche_detectado = True
+def get_noise_cv(image_path):
+    img = cv2.imread(image_path, 0)
+    if img is None: return 0.0
+    laplacian = cv2.Laplacian(img, cv2.CV_64F)
+    return float(np.std(laplacian) / (np.mean(np.abs(laplacian)) + 1e-6))
 
-    return img_result, parche_detectado, score_ruido, score_ela
+def get_exif(image_path):
+    hallazgos = []
+    puntos = 0
+    try:
+        exif_dict = piexif.load(image_path)
+        soft = str(exif_dict.get("0th", {}).get(piexif.ImageIFD.Software, b"")).lower()
+        if any(x in soft for x in ["photoshop", "canva", "picsart", "adobe"]):
+            hallazgos.append(f"🔴 Software de edición: {soft}")
+            puntos += 4
+        else:
+            hallazgos.append("✅ Sin software de edición en metadatos.")
+    except:
+        hallazgos.append("🟡 Sin metadatos EXIF (posible screenshot o procesada)")
+        puntos += 1
+    return puntos, hallazgos
 
 # ═══════════════════════════════════════════════════════════════
-# HANDLER PRINCIPAL (Garantiza el Dictamen)
+# HANDLER PRINCIPAL
 # ═══════════════════════════════════════════════════════════════
+
 async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = str(uuid.uuid4())[:8]
-    in_file, out_file = f"in_{uid}.jpg", f"res_{uid}.jpg"
+    in_p, ela_p = f"in_{uid}.jpg", f"ela_{uid}.jpg"
     
     try:
-        # Descarga
         f = await update.message.photo[-1].get_file()
-        await f.download_to_drive(in_file)
+        await f.download_to_drive(in_p)
         await update.message.reply_text("🔬 *Iniciando escaneo forense digital...*", parse_mode="Markdown")
         
-        # Procesamiento
-        res_img, detectado, s_ruido, s_ela = perform_analysis(in_file)
-        cv2.imwrite(out_file, res_img)
+        # Ejecutar Módulos
+        ela_score, ela_img = get_ela(in_p)
+        noise_cv = get_noise_cv(in_p)
+        exif_pts, exif_h = get_exif(in_p)
         
-        # Cálculo de Riesgo
-        puntos = 0
-        hallazgos = []
-        if detectado:
-            puntos += 6
-            hallazgos.append("🔴 **Parche Detectado**: Se hallaron rectángulos con textura artificial (marcados en rojo).")
-        if s_ruido < 135:
-            puntos += 3
-            hallazgos.append(f"🟡 **Bajo Ruido ({s_ruido:.1f})**: El papel es demasiado liso, sugiere edición digital.")
-        if s_ela > 5.5:
-            puntos += 1
-            hallazgos.append("🟡 **Inconsistencia ELA**: Compresión JPEG no uniforme.")
+        # Guardar imagen ELA para mostrar
+        ela_img.save(ela_p)
+        await update.message.reply_photo(photo=open(ela_p, "rb"), caption="🖼️ Mapa ELA (Compresión)")
 
-        risk_score = min(puntos, 10)
-        veredicto = "🔴 RIESGO ALTO — Probable Alteración" if risk_score >= 6 else "🟢 CONFIABLE — Sin anomalías claras"
-        barra = "█" * risk_score + "░" * (10 - risk_score)
-
-        # 1. Enviar imagen marcada
-        with open(out_file, "rb") as photo:
-            await update.message.reply_photo(photo=photo, caption="📸 Imagen analizada con marcadores de riesgo.")
+        # Lógica de Scoring para el Dictamen
+        risk = 0.0
+        detalles = []
         
-        # 2. Enviar el DICTAMEN (Formato corregido)
+        if ela_score > 5.0:
+            risk += 4.0
+            detalles.append(f"🔴 **ELA Crítico** ({ela_score:.2f}): Zonas editadas.")
+        else:
+            detalles.append(f"🟢 ELA normal ({ela_score:.2f}): Compresión uniforme.")
+
+        if noise_cv > 0.8:
+            risk += 2.0
+            detalles.append(f"🔴 **Ruido Inconsistente** (CV={noise_cv:.2f})")
+        else:
+            detalles.append(f"🟢 Ruido uniforme (CV={noise_cv:.2f})")
+            
+        risk = min(risk + exif_pts, 10.0)
+        
+        # Veredicto
+        if risk >= 6.0: titulo = "🔴 RIESGO ALTO — Probable falsificación"
+        elif risk >= 3.0: titulo = "🟡 RIESGO MODERADO — Revisión humana"
+        else: titulo = "🟢 CONFIABLE — Sin anomalías"
+
+        # CONSTRUCCIÓN DEL MENSAJE FINAL (DICTAMEN)
+        barra = "█" * int(risk) + "░" * (10 - int(risk))
         reporte = (
             f"📊 *DICTAMEN FORENSE DIGITAL*\n"
-            f"──────────────────────────────\n"
-            f"*Veredicto:* {veredicto}\n"
-            f"*Riesgo:* `[{barra}]` {risk_score}/10\n\n"
-            f"*Hallazgos Técnicos:*\n"
-            f"{chr(10).join(hallazgos) if hallazgos else '✅ No se detectan anomalías de textura.'}\n\n"
-            f"──────────────────────────────\n"
-            f"⚠️ _Este análisis es una herramienta de apoyo, no sustituye el ojo humano._"
+            f"{'─' * 32}\n\n"
+            f"*Veredicto:* {titulo}\n"
+            f"*Riesgo:* `[{barra}]` {risk:.1/10}\n"
+            f"_Análisis por micro-textura y metadatos._\n\n"
+            f"*Análisis Detallado:*\n"
+            f"{chr(10).join(detalles)}\n\n"
+            f"*📋 Metadatos EXIF:*\n"
+            f"{chr(10).join(['  ' + h for h in exif_h])}\n\n"
+            f"{'─' * 32}\n"
+            f"⚠️ _Este análisis es orientativo. El criterio humano es indispensable._"
         )
         
         await update.message.reply_text(reporte, parse_mode=constants.ParseMode.MARKDOWN)
 
     except Exception as e:
-        logging.error(f"Error técnico: {e}")
-        await update.message.reply_text("❌ Error al procesar la imagen. Intente de nuevo.")
+        logging.error(f"Error: {e}")
+        await update.message.reply_text("❌ Error al procesar.")
     finally:
-        # Borrado garantizado de archivos
-        for p in [in_file, out_file]:
-            if os.path.exists(p):
-                try: os.remove(p)
-                except: pass
+        for p in [in_p, ela_p]:
+            if os.path.exists(p): os.remove(p)
 
 if __name__ == "__main__":
     threading.Thread(target=run_flask, daemon=True).start()
