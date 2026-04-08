@@ -2,3 +2,5 @@ python-telegram-bot
 Pillow
 numpy
 flask
+opencv-python-headless
+scikit-image
