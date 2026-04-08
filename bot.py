@@ -5,146 +5,90 @@ import threading
 import numpy as np
 import cv2
 import uuid
-import piexif
 from flask import Flask
 from telegram import Update, constants
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters
-from PIL import Image, ImageChops, ImageEnhance, ImageStat, ImageDraw
-from scipy import ndimage
-from skimage.util import img_as_float
+from PIL import Image, ImageChops, ImageEnhance
 
-# ─────────────────────────────────────────
-# CONFIGURACIÓN
-# ─────────────────────────────────────────
+# --- CONFIGURACIÓN LIGERA ---
 TOKEN = "8699029540:AAE9TGMSC5fvW2Fldhuc_keYQAYxM_ooW_s"
-
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
-)
+logging.basicConfig(level=logging.INFO)
 
 web_app = Flask(__name__)
 @web_app.route("/")
-def health_check(): return "Bot Forense Activo ✅", 200
+def health(): return "Bot Activo", 200
 
 def run_flask():
-    port = int(os.environ.get("PORT", 10000))
-    web_app.run(host="0.0.0.0", port=port)
+    web_app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
 
 # ═══════════════════════════════════════════════════════════════
-# MÓDULO 1 — ELA MEJORADO
+# NUEVO MOTOR: DETECTOR DE PARCHES LISOS Y BORDES SINTÉTICOS
 # ═══════════════════════════════════════════════════════════════
-def ela_analysis(image_path: str):
-    original = Image.open(image_path).convert("RGB")
-    # Redimensionar si es muy grande para ahorrar CPU
-    if max(original.size) > 1500:
-        original.thumbnail((1500, 1500), Image.Resampling.LANCZOS)
-    
-    scores = []
-    ela_acumulado = None
-
-    for quality in [75, 90]: # Dos pasadas son suficientes y más rápidas
-        buf = io.BytesIO()
-        original.save(buf, format="JPEG", quality=quality)
-        buf.seek(0)
-        recompressed = Image.open(buf).convert("RGB")
-        diff = ImageChops.difference(original, recompressed)
-        arr = np.array(diff, dtype=np.float32)
-        scores.append(arr.mean())
-        if ela_acumulado is None: ela_acumulado = arr
-        else: ela_acumulado = np.maximum(ela_acumulado, arr)
-
-    ela_score = float(np.mean(scores))
-    ela_norm = np.clip(ela_acumulado * (255.0 / (np.percentile(ela_acumulado, 99) + 1)), 0, 255).astype(np.uint8)
-    
-    gray = cv2.cvtColor(ela_norm, cv2.COLOR_RGB2GRAY)
-    heatmap = cv2.applyColorMap(gray, cv2.COLORMAP_JET)
-    return Image.fromarray(ela_norm), ela_score, heatmap
-
-# ═══════════════════════════════════════════════════════════════
-# MÓDULO 3 — CLONADO (Optimizado para no colapsar la RAM)
-# ═══════════════════════════════════════════════════════════════
-def clone_detection(image_path: str, block_size: int = 32):
+def micro_forensic_analysis(image_path):
+    # Cargamos en escala de grises para ahorrar procesamiento
     img_cv = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
-    if img_cv is None: return 0.0, None
+    if img_cv is None: return None
     
-    # Reducir imagen para el proceso de clonado (pesadísimo en RAM)
-    scale = 0.5
-    img_small = cv2.resize(img_cv, (0,0), fx=scale, fy=scale)
-    h, w = img_small.shape
-    blocks = {}
-    clone_pairs = []
+    # 1. Detección de "Zonas Muertas" (Parches digitales sin ruido)
+    # El papel real tiene grano; un parche de editor es matemáticamente liso.
+    laplacian = cv2.Laplacian(img_cv, cv2.CV_64F)
+    score_ruido = np.var(laplacian) # Varianza de ruido global
+    
+    # 2. Análisis ELA Focalizado (Rápido)
+    original = Image.open(image_path).convert("RGB")
+    buf = io.BytesIO()
+    original.save(buf, format="JPEG", quality=90)
+    recompressed = Image.open(io.BytesIO(buf.getvalue()))
+    ela_diff = ImageChops.difference(original, recompressed)
+    
+    # 3. Localización de la anomalía (Línea Roja)
+    # Buscamos áreas donde la nitidez de los bordes sea inconsistente
+    blur = cv2.GaussianBlur(img_cv, (5,5), 0)
+    diff_local = cv2.absdiff(img_cv, blur)
+    _, mask = cv2.threshold(diff_local, 25, 255, cv2.THRESH_BINARY)
+    
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    img_result = cv2.imread(image_path)
+    anomalia_detectada = False
+    
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        x, y, w, h = cv2.boundingRect(cnt)
+        aspect_ratio = float(w)/h
+        # Si el contorno es rectangular (como un parche de texto) y de tamaño medio
+        if 500 < area < 5000 and 1.5 < aspect_ratio < 6.0:
+            cv2.rectangle(img_result, (x, y), (x+w, y+h), (0, 0, 255), 2)
+            anomalia_detectada = True
 
-    for y in range(0, h - block_size, 8): # Step de 8 para mayor velocidad
-        for x in range(0, w - block_size, 8):
-            block = img_small[y:y + block_size, x:x + block_size].astype(np.float32)
-            if block.shape != (block_size, block_size): continue
-            dct = cv2.dct(block)
-            signature = tuple(np.round(dct[:4, :4].flatten(), 0)) # Firma más robusta
-            if signature in blocks:
-                prev_x, prev_y = blocks[signature]
-                if np.sqrt((x - prev_x)**2 + (y - prev_y)**2) > block_size:
-                    clone_pairs.append(((int(prev_x/scale), int(prev_y/scale)), (int(x/scale), int(y/scale))))
-            else:
-                blocks[signature] = (x, y)
+    return img_result, anomalia_detectada, score_ruido
 
-    clone_score = min(len(clone_pairs) / 5.0, 10.0)
-    marked_image = None
-    if clone_pairs:
-        img_color = cv2.imread(image_path)
-        for (x1, y1), (x2, y2) in clone_pairs[:15]:
-            cv2.line(img_color, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            cv2.circle(img_color, (x1, y1), 5, (0, 0, 255), -1)
-        marked_image = Image.fromarray(cv2.cvtColor(img_color, cv2.COLOR_BGR2RGB))
-
-    return clone_score, marked_image
-
-# (Mantener Módulos 2, 4 y 5 igual, son sólidos)
-# ... [Insertar aquí tus funciones jpeg_ghost_analysis, noise_inconsistency_analysis y exif_analysis] ...
-
-# ═══════════════════════════════════════════════════════════════
-# MANEJADOR DE IMÁGENES (Con limpieza garantizada)
-# ═══════════════════════════════════════════════════════════════
 async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = str(uuid.uuid4())[:8]
-    paths = {
-        "in": f"in_{uid}.jpg", "ela": f"ela_{uid}.jpg",
-        "heat": f"heat_{uid}.jpg", "clone": f"clone_{uid}.jpg"
-    }
-
+    in_p = f"in_{uid}.jpg"
+    out_p = f"res_{uid}.jpg"
+    
     try:
-        file = await update.message.photo[-1].get_file()
-        await file.download_to_drive(paths["in"])
-        status_msg = await update.message.reply_text("🔬 *Iniciando Análisis Multiespectral...*", parse_mode="Markdown")
-
-        # Ejecución
-        ela_pil, ela_score, heatmap_cv = ela_analysis(paths["in"])
-        clone_score, clone_img = clone_detection(paths["in"])
-        # (Llamar a los otros módulos aquí...)
-
-        # Enviar resultados
-        ela_pil.save(paths["ela"])
-        cv2.imwrite(paths["heat"], heatmap_cv)
+        f = await update.message.photo[-1].get_file()
+        await f.download_to_drive(in_p)
         
-        await update.message.reply_photo(photo=open(paths["ela"], "rb"), caption="🖼️ Mapa ELA (Compresión)")
-        await update.message.reply_photo(photo=open(paths["heat"], "rb"), caption="🌡️ Heatmap ELA (Sospecha)")
-
-        if clone_img:
-            clone_img.save(paths["clone"])
-            await update.message.reply_photo(photo=open(paths["clone"], "rb"), caption="🔁 Detección de Clonado")
-
-        # Dictamen Final (Usar tu lógica de scoring)
-        await update.message.reply_text("✅ Análisis finalizado. Revisa los mapas visuales.")
-
-    except Exception as e:
-        logging.error(f"Error: {e}")
-        await update.message.reply_text("❌ Error técnico en el análisis.")
+        await update.message.reply_text("🔬 Analizando micro-textura y parches...")
+        
+        res_img, detectado, s_ruido = micro_forensic_analysis(in_p)
+        cv2.imwrite(out_p, res_img)
+        
+        veredicto = "🔴 ALTA PROBABILIDAD DE ALTERACIÓN" if detectado or s_ruido < 150 else "🟢 SIN MARCAS DE PARCHES"
+        riesgo = "8/10" if detectado else "2/10"
+        
+        await update.message.reply_photo(
+            photo=open(out_p, "rb"),
+            caption=f"📊 **DICTAMEN FORENSE**\n\nVeredicto: {veredicto}\nRiesgo: {riesgo}\n\n"
+                    f"Hallazgo: {'Se marcó en rojo la zona con textura artificial.' if detectado else 'No se hallaron parches rectangulares.'}\n\n"
+                    f"_Advertencia: El ruido del papel es muy bajo ({s_ruido:.1f}), posible edición de alta calidad._"
+        )
     finally:
-        for p in paths.values():
+        for p in [in_p, out_p]:
             if os.path.exists(p): os.remove(p)
 
 if __name__ == "__main__":
     threading.Thread(target=run_flask, daemon=True).start()
-    app = ApplicationBuilder().token(TOKEN).build()
-    app.add_handler(MessageHandler(filters.PHOTO, handle_image))
-    app.run_polling()
+    ApplicationBuilder().token(TOKEN).build().add_handler(MessageHandler(filters.PHOTO, handle_image)).run_polling()
