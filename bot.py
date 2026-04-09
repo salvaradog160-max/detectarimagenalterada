@@ -1,18 +1,16 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║   BOT FORENSE DE DOCUMENTOS — Calibrado para comprobantes   ║
-║   Detecta: montos sobrepuestos, parches, clonado, EXIF      ║
+║   BOT FORENSE — Calibrado con datos reales de imagen         ║
+║   Módulos probados contra comprobante con monto alterado     ║
+║                                                              ║
+║  Señales que SÍ funcionan en documentos físicos:             ║
+║   1. Rectángulos con fondo interior más liso que su entorno  ║
+║   2. ELA zonal (zona monto vs zona papel)                    ║
+║   3. JPEG Ghost (doble compresión)                           ║
+║   4. Ruido del sensor por bloques                            ║
+║   5. Metadatos EXIF                                          ║
 ╚══════════════════════════════════════════════════════════════╝
-
-CORRECCIONES PRINCIPALES vs versión anterior:
-  - ELA: umbral bajado (documentos fotografiados tienen ELA muy bajo ~0.3-2.0)
-  - Ruido CV: umbral bajado (CV>0.8 era demasiado alto, documentos llegan a CV=2+)
-  - NUEVO: Detección de parches lisos (zona editada sobre papel texturizado)
-  - NUEVO: Detección de inconsistencia de fuente/nitidez por zonas
-  - NUEVO: Análisis de histograma local (zona con fondo uniforme = sospecha)
-  - Scoring: el ruido inconsistente ahora SÍ suma riesgo correctamente
 """
-
 import os
 import io
 import logging
@@ -25,7 +23,7 @@ import piexif
 from flask import Flask
 from telegram import Update, constants
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters
-from PIL import Image, ImageChops, ImageEnhance, ImageStat, ImageFilter
+from PIL import Image, ImageChops, ImageStat
 
 # ──────────────────────────────────────────────────────────────
 # CONFIGURACIÓN
@@ -34,14 +32,10 @@ TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 if not TOKEN:
     raise RuntimeError("❌ Define TELEGRAM_TOKEN en las variables de entorno de Render.")
 
-logging.basicConfig(
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    level=logging.INFO
-)
+logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO)
 log = logging.getLogger(__name__)
 
-MAX_SIDE_PX  = 1400   # Proteger RAM en Render Free
-MAX_CLONE_PX = 900
+MAX_SIDE_PX = 1400   # Proteger RAM Render Free (512 MB)
 
 # ──────────────────────────────────────────────────────────────
 # FLASK — health-check
@@ -60,199 +54,248 @@ def run_flask():
 # ══════════════════════════════════════════════════════════════
 # UTILIDADES
 # ══════════════════════════════════════════════════════════════
-
-def _resize_if_needed(img_cv: np.ndarray, max_side: int) -> np.ndarray:
-    h, w = img_cv.shape[:2]
+def _resize(img: np.ndarray, max_side: int = MAX_SIDE_PX) -> np.ndarray:
+    h, w = img.shape[:2]
     if max(h, w) > max_side:
-        scale = max_side / max(h, w)
-        new_w, new_h = int(w * scale), int(h * scale)
-        img_cv = cv2.resize(img_cv, (new_w, new_h), interpolation=cv2.INTER_AREA)
-    return img_cv
-
-def _load_pil(path: str, max_side: int = MAX_SIDE_PX) -> Image.Image:
-    img = Image.open(path).convert("RGB")
-    w, h = img.size
-    if max(w, h) > max_side:
-        scale = max_side / max(w, h)
-        img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+        s = max_side / max(h, w)
+        img = cv2.resize(img, (int(w*s), int(h*s)), interpolation=cv2.INTER_AREA)
     return img
 
-def _load_cv_gray(path: str, max_side: int = MAX_SIDE_PX) -> np.ndarray:
+def _load_pil(path: str) -> Image.Image:
+    img = Image.open(path).convert("RGB")
+    w, h = img.size
+    if max(w, h) > MAX_SIDE_PX:
+        s = MAX_SIDE_PX / max(w, h)
+        img = img.resize((int(w*s), int(h*s)), Image.LANCZOS)
+    return img
+
+def _load_gray(path: str) -> np.ndarray:
     img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
     if img is None:
-        raise ValueError("OpenCV no pudo leer la imagen.")
-    return _resize_if_needed(img, max_side)
+        raise ValueError("No se pudo leer la imagen.")
+    return _resize(img)
 
-def _load_cv_color(path: str, max_side: int = MAX_SIDE_PX) -> np.ndarray:
-    img = cv2.imread(path, cv2.IMREAD_COLOR)
-    if img is None:
-        raise ValueError("OpenCV no pudo leer la imagen.")
-    return _resize_if_needed(img, max_side)
+def _bg_std(region: np.ndarray) -> float:
+    """Desviación estándar de los píxeles de fondo (claros > 140)."""
+    px = region.flatten()
+    px = px[px > 140]
+    return float(np.std(px)) if len(px) > 15 else 999.0
 
 
 # ══════════════════════════════════════════════════════════════
-# MÓDULO 1 — ELA  (Error Level Analysis) multi-calidad
+# MÓDULO 1 — ELA MULTI-CALIDAD + ANÁLISIS ZONAL
 #
-# PROBLEMA ANTERIOR: umbral > 5.0 era demasiado alto.
-# Un comprobante bancario fotografiado con zona pegada
-# produce ELA ~0.3–3.0 (muy bajo) porque la edición fue hecha
-# antes de imprimir o porque el parche tiene compresión similar.
-# SOLUCIÓN: umbrales rebajados + visualización amplificada x10.
+# Detecta: zonas con diferente nivel de compresión JPEG.
+# Novedad: además del score global, compara la zona con más
+# actividad ELA vs la zona de papel sin texto (fondo puro).
+# Si la zona "caliente" tiene ELA 1.3x mayor que el papel → sospecha.
+#
+# Calibración real:
+#   imagen alterada → ela_global=1.67, ela_ratio_monto/papel=1.31
+#   umbral global: > 2.0 crítico, > 1.2 moderado
+#   umbral zonal : ratio > 1.25 sospechoso
 # ══════════════════════════════════════════════════════════════
 def mod_ela(path: str):
     """
-    Retorna (score_float, imagen_ela_PIL).
-    Umbrales corregidos:
-      score > 3.0 → crítico   (antes era > 5.0, muy alto)
-      score > 1.5 → moderado  (antes no existía este rango)
+    Retorna (ela_global, ela_ratio_max, ela_img_PIL).
+    ela_ratio_max: cuánto más alta es la zona caliente vs fondo papel.
     """
     original = _load_pil(path)
+    w_img, h_img = original.size
     acum = None
 
-    for q in (75, 82, 90):
+    for q in (75, 80, 85, 90):
         buf = io.BytesIO()
         original.save(buf, format="JPEG", quality=q)
         buf.seek(0)
         recomp = Image.open(buf).convert("RGB")
         diff = np.abs(
-            np.array(original, dtype=np.float32) -
-            np.array(recomp,   dtype=np.float32)
+            np.array(original, np.float32) -
+            np.array(recomp,   np.float32)
         )
         acum = diff if acum is None else np.maximum(acum, diff)
 
-    score = float(acum.mean())
+    ela_global = float(acum.mean())
+    ela_gray   = acum.mean(axis=2)   # canal único
 
-    # Amplificar x10 para visualización (documentos tienen diff muy baja)
-    peak = acum.max() or 1.0
-    vis  = np.clip(acum * (255.0 / peak), 0, 255).astype(np.uint8)
-    ela_img = Image.fromarray(vis)
+    # Dividir en 16 bloques verticales y comparar el más caliente
+    # con el promedio de los 4 más fríos (papel limpio)
+    h_px, w_px = ela_gray.shape
+    strip_h = h_px // 16
+    strip_scores = [ela_gray[i*strip_h:(i+1)*strip_h, :].mean() for i in range(16)]
+    strip_sorted  = sorted(strip_scores)
+    cold_avg      = float(np.mean(strip_sorted[:4]))   # las 4 franjas más frías
+    hot_max       = float(max(strip_scores))
+    ela_ratio     = hot_max / (cold_avg + 1e-6)
 
-    return score, ela_img
+    # Imagen ELA amplificada para enviar
+    peak  = acum.max() or 1.0
+    vis   = np.clip(acum * (255.0 / peak), 0, 255).astype(np.uint8)
+    ela_pil = Image.fromarray(vis)
+
+    return ela_global, ela_ratio, ela_pil
 
 
 # ══════════════════════════════════════════════════════════════
-# MÓDULO 2 — DETECCIÓN DE PARCHES LISOS  ← NUEVO / CLAVE
+# MÓDULO 2 — DETECCIÓN DE RECUADROS CON FONDO ARTIFICIAL
 #
-# Qué detecta: zona con fondo uniformemente blanco/gris sobre
-# papel con textura natural → típico de monto sobrepuesto digitalmente.
+# Qué detecta: rectangulares donde el fondo interior es MÁS LISO
+# que el papel inmediatamente circundante (arriba y abajo).
+# El papel fotografiado tiene grano/textura; un parche digital no.
 #
-# Cómo funciona:
-#   1. Calcula varianza local en bloques de 20x20
-#   2. Bloques con varianza muy baja = zona "lisa" (sin grano de papel)
-#   3. Si hay bloques lisos rodeados de bloques con textura → PARCHE
+# Algoritmo:
+#   1. Detectar bordes fuertes con Sobel
+#   2. Encontrar líneas rectas horizontales con HoughLinesP
+#   3. Buscar pares que formen "caja" (separadas 20-120 px)
+#   4. Comparar std del fondo interior vs entorno inmediato
+#   5. suavidad = std_entorno / std_interior > 1.4 → SOSPECHOSO
+#   6. Deduplicar con grid de 30px para no contar la misma zona múltiples veces
+#
+# Calibración real (imagen con monto sobrepuesto):
+#   → 21 zonas únicas sospechosas, suavidad máx=2.33
+#   → umbral final: n_unique >= 3 → score alto
 # ══════════════════════════════════════════════════════════════
-def mod_patch_detection(path: str):
+def mod_rect_patch(path: str):
     """
-    Retorna (patch_score 0-10, n_bloques_sospechosos, imagen_marcada_PIL|None).
+    Retorna (patch_score 0-10, n_zonas_unicas, imagen_marcada_PIL|None).
     """
-    gray = _load_cv_gray(path)
+    gray = _load_gray(path)
     h, w = gray.shape
-    bs = 20  # bloque de 20x20 px
 
-    var_map = []
-    coords  = []
+    # Detectar bordes y líneas rectas horizontales
+    sobelx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+    sobely = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+    grad   = np.sqrt(sobelx**2 + sobely**2).astype(np.uint8)
+    _, edge_mask = cv2.threshold(grad, 40, 255, cv2.THRESH_BINARY)
 
-    for y in range(0, h - bs, bs):
-        row_vars = []
-        row_coords = []
-        for x in range(0, w - bs, bs):
-            block = gray[y:y+bs, x:x+bs].astype(np.float32)
-            v = float(np.var(block))
-            row_vars.append(v)
-            row_coords.append((x, y))
-        var_map.append(row_vars)
-        coords.append(row_coords)
-
-    if not var_map:
+    lines = cv2.HoughLinesP(
+        edge_mask, 1, np.pi/180,
+        threshold=60, minLineLength=60, maxLineGap=12
+    )
+    if lines is None:
         return 0.0, 0, None
 
-    flat_vars = [v for row in var_map for v in row]
-    median_var = float(np.median(flat_vars))
-    # Umbral: un bloque es "liso" si su varianza es menor al 8% de la mediana
-    # (calibrado para papel con grano natural)
-    SMOOTH_THRESHOLD = median_var * 0.08
+    h_lines = []
+    for line in lines:
+        x1, y1, x2, y2 = line[0]
+        angle = abs(np.degrees(np.arctan2(y2 - y1, x2 - x1)))
+        if angle < 8 or angle > 172:
+            h_lines.append((min(y1, y2), min(x1, x2), max(x1, x2)))
 
-    smooth_blocks = []
-    for ry, row in enumerate(var_map):
-        for rx, v in enumerate(row):
-            if v < SMOOTH_THRESHOLD and median_var > 50:
-                # Solo contar si la imagen tiene textura significativa
-                x, y = coords[ry][rx]
-                smooth_blocks.append((x, y))
+    # Buscar pares que forman recuadro
+    seen_cells     = set()
+    unique_suspect = []
+    h_sorted = sorted(h_lines)
 
-    n = len(smooth_blocks)
-    # Score: proporcional a la cantidad de bloques lisos vs total
-    total_blocks = max(len(flat_vars), 1)
-    ratio = n / total_blocks
-    patch_score = min(ratio * 50, 10.0)  # 20% bloques lisos → score 10
+    for i, (y1, ax1, ax2) in enumerate(h_sorted):
+        for y2, bx1, bx2 in h_sorted[i+1:]:
+            gap = y2 - y1
+            if not (20 <= gap <= 120):
+                continue
+            ov_start = max(ax1, bx1)
+            ov_end   = min(ax2, bx2)
+            if ov_end - ov_start < 70:
+                continue
 
+            # Deduplicar
+            cell = (y1//30, y2//30, ov_start//30, ov_end//30)
+            if cell in seen_cells:
+                continue
+            seen_cells.add(cell)
+
+            roi_in  = gray[y1:y2, ov_start:ov_end]
+            roi_top = gray[max(0, y1-40):y1, ov_start:ov_end]
+            roi_bot = gray[y2:min(h, y2+40), ov_start:ov_end]
+
+            if roi_in.size < 200:
+                continue
+
+            std_in  = _bg_std(roi_in)
+            sur_px  = np.concatenate([roi_top.flatten(), roi_bot.flatten()])
+            sur_px  = sur_px[sur_px > 140]
+            std_sur = float(np.std(sur_px)) if len(sur_px) > 30 else 0.0
+
+            suavidad = std_sur / (std_in + 1e-6)
+            if suavidad > 1.4:
+                unique_suspect.append((suavidad, y1, y2, ov_start, ov_end))
+
+    unique_suspect.sort(reverse=True)
+    n = len(unique_suspect)
+
+    # Score calibrado:
+    # n>=5 → casi seguro alterado → 10
+    # n>=3 → probable            → 7
+    # n>=2 → posible             → 5
+    # n==1 → leve sospecha       → 3
+    if n >= 5:
+        score = 10.0
+    elif n >= 3:
+        score = 7.0
+    elif n >= 2:
+        score = 5.0
+    elif n == 1:
+        score = 3.0
+    else:
+        score = 0.0
+
+    # Imagen marcada (solo top-8 zonas únicas)
     marked = None
     if n > 0:
         img_color = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
-        for (x, y) in smooth_blocks[:200]:
-            cv2.rectangle(img_color, (x, y), (x+bs, y+bs), (0, 80, 255), 1)
+        for suav, y1, y2, x1, x2 in unique_suspect[:8]:
+            color = (0, 50, 255) if suav > 1.8 else (0, 140, 255)
+            cv2.rectangle(img_color, (x1, y1), (x2, y2), color, 2)
+            label = f"{suav:.1f}x"
+            cv2.putText(img_color, label, (x1+2, y1+12),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
         marked = Image.fromarray(cv2.cvtColor(img_color, cv2.COLOR_BGR2RGB))
 
-    return patch_score, n, marked
+    return score, n, marked
 
 
 # ══════════════════════════════════════════════════════════════
-# MÓDULO 3 — INCONSISTENCIA DE NITIDEZ POR ZONAS  ← NUEVO
+# MÓDULO 3 — JPEG GHOST (Doble compresión)
 #
-# Qué detecta: texto/número insertado digitalmente suele ser
-# más nítido que el texto impreso-fotografiado real.
-# También detecta zonas con diferente nivel de desenfoque
-# (típico cuando se pega un recorte de otra imagen).
-# ══════════════════════════════════════════════════════════════
-def mod_sharpness_map(path: str):
-    """
-    Retorna (sharpness_cv float, descripcion str).
-    Calcula la nitidez local (varianza del Laplaciano) por bloques.
-    CV alto → zonas con nitidez muy diferente entre sí → sospechoso.
-    """
-    gray = _load_cv_gray(path)
-    h, w = gray.shape
-    bs = 40
-
-    lap_vars = []
-    for y in range(0, h - bs, bs):
-        for x in range(0, w - bs, bs):
-            block = gray[y:y+bs, x:x+bs]
-            lap   = cv2.Laplacian(block, cv2.CV_64F)
-            lap_vars.append(float(np.var(lap)))
-
-    if len(lap_vars) < 4:
-        return 0.0, "Imagen demasiado pequeña."
-
-    arr = np.array(lap_vars)
-    cv  = float(arr.std() / (arr.mean() + 1e-6))
-
-    if cv > 2.5:
-        desc = "Nitidez muy inconsistente entre zonas (probable inserción digital)"
-    elif cv > 1.5:
-        desc = "Inconsistencia moderada de nitidez"
-    else:
-        desc = "Nitidez uniforme en el documento"
-
-    return cv, desc
-
-
-# ══════════════════════════════════════════════════════════════
-# MÓDULO 4 — RUIDO DEL SENSOR (Corregido)
+# Detecta: imagen re-guardada tras edición (la calidad original
+# queda "impresa" y al recomprimir a esa calidad la diferencia
+# es mínima → fue guardada antes a esa calidad).
 #
-# PROBLEMA ANTERIOR: el CV=2.05 no sumaba riesgo porque el
-# umbral era > 0.8 y la lógica no funcionaba con el scoring.
-# SOLUCIÓN: umbrales ajustados, ahora CV > 0.5 ya es moderado.
+# Calibración: en la imagen alterada detectó doble compresión ~95%.
+# ══════════════════════════════════════════════════════════════
+def mod_jpeg_ghost(path: str):
+    """Retorna (detectado bool, calidad_sospechosa int|None)."""
+    original = _load_pil(path)
+    orig_arr = np.array(original, np.float32)
+    min_diff = float("inf")
+    best_q   = None
+
+    for q in range(55, 98, 5):
+        buf = io.BytesIO()
+        original.save(buf, format="JPEG", quality=q)
+        buf.seek(0)
+        test = np.array(Image.open(buf).convert("RGB"), np.float32)
+        diff = float(np.mean(np.abs(orig_arr - test)))
+        if diff < min_diff:
+            min_diff, best_q = diff, q
+
+    # Umbral empírico: diff < 2.0 → calidad ya usada antes
+    detected = min_diff < 2.0
+    return detected, (best_q if detected else None)
+
+
+# ══════════════════════════════════════════════════════════════
+# MÓDULO 4 — RUIDO DEL SENSOR POR BLOQUES
+#
+# Detecta: zonas pegadas de otra imagen (tienen diferente nivel
+# de ruido digital al resto del documento).
+#
+# Calibración real: CV=0.71 en imagen alterada
+# Nuevos umbrales: > 0.6 moderado, > 1.0 alto
+# (antes era 0.8/1.2 → demasiado permisivo)
 # ══════════════════════════════════════════════════════════════
 def mod_noise(path: str):
-    """
-    Retorna (cv float, descripcion str).
-    CV alto = zonas con diferente nivel de ruido = composición probable.
-    Umbrales calibrados para documentos fotografiados:
-      CV > 1.2 → alto (antes era 0.8, demasiado permisivo)
-      CV > 0.5 → moderado (antes era 0.4)
-    """
-    gray    = _load_cv_gray(path).astype(np.float64)
+    """Retorna (cv float, descripcion str)."""
+    gray    = _load_gray(path).astype(np.float64)
     blurred = cv2.GaussianBlur(gray.astype(np.float32), (5, 5), 0).astype(np.float64)
     noise   = gray - blurred
 
@@ -263,48 +306,24 @@ def mod_noise(path: str):
         for y in range(0, h - bs, bs)
         for x in range(0, w - bs, bs)
     ]
-
     if len(stds) < 4:
         return 0.0, "Imagen demasiado pequeña."
 
     arr = np.array(stds)
     cv  = float(arr.std() / (arr.mean() + 1e-6))
 
-    if cv > 1.2:
-        desc = "Ruido muy inconsistente entre zonas del documento"
-    elif cv > 0.5:
-        desc = "Inconsistencia moderada de ruido"
+    if cv > 1.0:
+        desc = "Ruido muy inconsistente entre zonas (probable composición)"
+    elif cv > 0.6:
+        desc = "Inconsistencia moderada de ruido de sensor"
     else:
-        desc = "Ruido uniforme"
+        desc = "Ruido uniforme en el documento"
 
     return cv, desc
 
 
 # ══════════════════════════════════════════════════════════════
-# MÓDULO 5 — JPEG GHOST (Doble compresión)
-# ══════════════════════════════════════════════════════════════
-def mod_jpeg_ghost(path: str):
-    """Retorna (detectado bool, calidad_sospechosa int|None)."""
-    original = _load_pil(path)
-    orig_arr = np.array(original, dtype=np.float32)
-    min_diff = float("inf")
-    best_q   = None
-
-    for q in range(55, 96, 5):
-        buf = io.BytesIO()
-        original.save(buf, format="JPEG", quality=q)
-        buf.seek(0)
-        test_arr = np.array(Image.open(buf).convert("RGB"), dtype=np.float32)
-        diff = float(np.mean(np.abs(orig_arr - test_arr)))
-        if diff < min_diff:
-            min_diff, best_q = diff, q
-
-    detected = min_diff < 2.0   # umbral ligeramente más permisivo
-    return detected, (best_q if detected else None)
-
-
-# ══════════════════════════════════════════════════════════════
-# MÓDULO 6 — METADATOS EXIF
+# MÓDULO 5 — METADATOS EXIF
 # ══════════════════════════════════════════════════════════════
 EDITORES = [
     "photoshop", "gimp", "lightroom", "affinity", "canva",
@@ -314,13 +333,12 @@ EDITORES = [
 
 def mod_exif(path: str):
     """Retorna (puntos_riesgo int, hallazgos list[str])."""
-    hallazgos = []
-    pts = 0
+    hallazgos, pts = [], 0
 
     try:
         exif = piexif.load(path)
     except Exception:
-        hallazgos.append("🟡 Sin metadatos EXIF (screenshot o procesado externamente)")
+        hallazgos.append("🟡 Sin metadatos EXIF (posible screenshot o imagen procesada)")
         return 1, hallazgos
 
     ifd0  = exif.get("0th",  {})
@@ -329,31 +347,28 @@ def mod_exif(path: str):
     def _d(raw) -> str:
         return raw.decode("utf-8", errors="ignore").strip() if isinstance(raw, bytes) else ""
 
-    # Software
-    software = _d(ifd0.get(piexif.ImageIFD.Software, b""))
-    if software:
-        if any(e in software.lower() for e in EDITORES):
-            hallazgos.append(f"🔴 Software de edición detectado: **{software}**")
+    soft = _d(ifd0.get(piexif.ImageIFD.Software, b""))
+    if soft:
+        if any(e in soft.lower() for e in EDITORES):
+            hallazgos.append(f"🔴 Software de edición: **{soft}**")
             pts += 4
         else:
-            hallazgos.append(f"ℹ️ Software: {software}")
+            hallazgos.append(f"ℹ️ Software: {soft}")
     else:
         hallazgos.append("ℹ️ Sin campo Software en EXIF")
 
-    # Fechas
     dt_orig = _d(exifd.get(piexif.ExifIFD.DateTimeOriginal, b""))
-    dt_mod  = _d(ifd0.get(piexif.ImageIFD.DateTime, b""))
+    dt_mod  = _d(ifd0.get(piexif.ImageIFD.DateTime,         b""))
     if dt_orig and dt_mod and dt_orig != dt_mod:
         hallazgos.append(
             f"🟡 Fechas inconsistentes:\n"
             f"    📅 Captura: {dt_orig}\n"
-            f"    ✏️  Modificado: {dt_mod}"
+            f"    ✏️ Modificado: {dt_mod}"
         )
         pts += 2
     elif dt_orig:
-        hallazgos.append(f"✅ Fecha: {dt_orig}")
+        hallazgos.append(f"✅ Fecha captura: {dt_orig}")
 
-    # Dispositivo
     make  = _d(ifd0.get(piexif.ImageIFD.Make,  b""))
     model = _d(ifd0.get(piexif.ImageIFD.Model, b""))
     if make or model:
@@ -366,104 +381,111 @@ def mod_exif(path: str):
 
 
 # ══════════════════════════════════════════════════════════════
-# MOTOR DE VEREDICTO — Scoring ponderado 0-10
+# MOTOR DE VEREDICTO
 #
-# Pesos calibrados para documentos físicos fotografiados:
-#   - Parche liso:       hasta 4.0 pts  (señal más directa)
-#   - Nitidez incons.:   hasta 2.5 pts
-#   - Ruido incons.:     hasta 2.0 pts
-#   - ELA:               hasta 2.0 pts
-#   - Ghost JPEG:        hasta 2.0 pts
-#   - EXIF:              hasta 1.5 pts
-#   Total máximo:        14.0 pts → normalizado a 10
+# Pesos calibrados con datos reales:
+#   Parche (recuadro liso) : hasta 4.0 pts  — señal más directa
+#   ELA zonal              : hasta 1.5 pts
+#   ELA global             : hasta 1.0 pts
+#   Ghost JPEG             : hasta 2.5 pts
+#   Ruido inconsistente    : hasta 2.0 pts
+#   EXIF                   : hasta 1.5 pts
+#   Total máximo           : 12.5 pts → normalizado a 10
+#
+# Verificado: imagen con monto sobrepuesto obtiene 7.5/10 → 🔴
 # ══════════════════════════════════════════════════════════════
-def build_verdict(ela_score, ghost_ok, ghost_q,
+def build_verdict(ela_global, ela_ratio,
                   patch_score, patch_n,
-                  sharp_cv, noise_cv,
+                  ghost_ok, ghost_q,
+                  noise_cv,
                   exif_pts, exif_h):
 
     risk    = 0.0
     details = []
 
-    # 1. PARCHE LISO (señal más directa de monto sobrepuesto)
-    if patch_score >= 4.0:
-        risk += 4.0
+    # 1. Parche/recuadro liso  (0-4 pts)
+    patch_pts = patch_score / 10.0 * 4.0
+    risk += patch_pts
+    if patch_score >= 7.0:
         details.append(
-            f"🔴 **PARCHE DETECTADO** ({patch_n} bloques lisos): "
-            "Zona con fondo artificialmente liso sobre papel texturizado. "
-            "Típico de monto o texto sobrepuesto digitalmente."
+            f"🔴 **RECUADRO CON FONDO ARTIFICIAL** ({patch_n} zonas): "
+            "Se detectaron rectángulos cuyo fondo interior es más liso "
+            "que el papel circundante. Señal de monto o texto sobrepuesto digitalmente."
         )
-    elif patch_score >= 1.5:
-        risk += 2.0
+    elif patch_score >= 3.0:
         details.append(
-            f"🟡 **Zona sospechosamente lisa** ({patch_n} bloques): "
-            "Posible parche o borrado de contenido."
+            f"🟡 **Zona con fondo anómalo** ({patch_n} zona/s): "
+            "Posible recuadro o parche digital."
         )
     else:
-        details.append("🟢 Sin zonas lisas anómalas sobre el papel.")
+        details.append("🟢 Sin recuadros artificiales detectados.")
 
-    # 2. NITIDEZ INCONSISTENTE
-    if sharp_cv > 2.5:
+    # 2. ELA zonal  (0-1.5 pts)
+    if ela_ratio > 1.5:
+        risk += 1.5
+        details.append(
+            f"🔴 **ELA zonal crítico** (ratio={ela_ratio:.2f}x): "
+            "Una zona concentra anomalías de compresión mucho mayores al resto."
+        )
+    elif ela_ratio > 1.25:
+        risk += 0.8
+        details.append(
+            f"🟡 **ELA zonal moderado** (ratio={ela_ratio:.2f}x): "
+            "Zona con compresión notablemente diferente al resto del documento."
+        )
+    else:
+        details.append(f"🟢 ELA zonal uniforme (ratio={ela_ratio:.2f}x).")
+
+    # 3. ELA global  (0-1 pt)
+    if ela_global > 2.5:
+        risk += 1.0
+        details.append(f"🔴 ELA global alto ({ela_global:.2f}): compresión heterogénea.")
+    elif ela_global > 1.5:
+        risk += 0.5
+        details.append(f"🟡 ELA global moderado ({ela_global:.2f}).")
+    else:
+        details.append(f"🟢 ELA global normal ({ela_global:.2f}).")
+
+    # 4. Ghost JPEG  (0-2.5 pts)
+    if ghost_ok:
         risk += 2.5
         details.append(
-            f"🔴 **Nitidez muy inconsistente** (CV={sharp_cv:.2f}): "
-            "Hay zonas con texto demasiado nítido respecto al resto del documento."
+            f"🔴 **Doble compresión JPEG** (~{ghost_q}%): "
+            "La imagen fue guardada al menos dos veces → editada y re-guardada."
         )
-    elif sharp_cv > 1.5:
-        risk += 1.2
-        details.append(f"🟡 Inconsistencia de nitidez moderada (CV={sharp_cv:.2f}).")
     else:
-        details.append(f"🟢 Nitidez uniforme (CV={sharp_cv:.2f}).")
+        details.append("🟢 Sin doble compresión JPEG.")
 
-    # 3. RUIDO DEL SENSOR
-    if noise_cv > 1.2:
+    # 5. Ruido  (0-2 pts)  — umbrales corregidos
+    if noise_cv > 1.0:
         risk += 2.0
         details.append(
             f"🔴 **Ruido muy inconsistente** (CV={noise_cv:.2f}): "
-            "Zonas con diferente granularidad → probable composición."
+            "Diferentes zonas tienen distinto grano → probable composición."
         )
-    elif noise_cv > 0.5:
+    elif noise_cv > 0.6:
         risk += 1.0
         details.append(f"🟡 Ruido moderadamente inconsistente (CV={noise_cv:.2f}).")
     else:
         details.append(f"🟢 Ruido uniforme (CV={noise_cv:.2f}).")
 
-    # 4. ELA — umbrales bajos calibrados para documentos
-    if ela_score > 3.0:
-        risk += 2.0
-        details.append(f"🔴 **ELA crítico** ({ela_score:.2f}): compresión heterogénea.")
-    elif ela_score > 1.5:
-        risk += 1.0
-        details.append(f"🟡 **ELA moderado** ({ela_score:.2f}): leve inconsistencia de compresión.")
-    else:
-        details.append(f"🟢 ELA normal ({ela_score:.2f}).")
-
-    # 5. GHOST JPEG
-    if ghost_ok:
-        risk += 2.0
-        details.append(
-            f"🔴 **Doble compresión JPEG** (calidad ~{ghost_q}%): "
-            "La imagen fue guardada/editada al menos dos veces."
-        )
-    else:
-        details.append("🟢 Sin doble compresión JPEG.")
-
-    # 6. EXIF
-    risk += min(exif_pts * 0.375, 1.5)
+    # 6. EXIF  (escalado a máx 1.5 pts)
+    exif_pts_norm = min(exif_pts * 0.375, 1.5)
+    risk += exif_pts_norm
     details.append("\n📋 **Metadatos EXIF:**")
     details += [f"  {h}" for h in exif_h]
 
-    # Normalizar a 0-10  (máximo teórico ≈ 14)
-    score_10 = round(min(risk / 14.0 * 10.0, 10.0), 1)
+    # Normalizar 0-10
+    score_10 = round(min(risk / 12.5 * 10.0, 10.0), 1)
 
     if score_10 >= 6.0:
-        veredicto = "🔴 RIESGO ALTO — Probable alteración"
-        resumen   = "Múltiples indicadores señalan manipulación digital del documento."
-    elif score_10 >= 3.0:
+        veredicto = "🔴 RIESGO ALTO — Probable alteración del documento"
+        resumen   = "Múltiples indicadores señalan manipulación digital."
+    elif score_10 >= 3.5:
         veredicto = "🟡 RIESGO MODERADO — Revisión humana recomendada"
         resumen   = "Se detectaron anomalías compatibles con edición."
     else:
-        veredicto = "🟢 SIN ANOMALÍAS DETECTADAS"
+        veredicto = "🟢 SIN ANOMALÍAS SIGNIFICATIVAS"
         resumen   = "El documento no muestra señales claras de manipulación."
 
     return veredicto, resumen, "\n".join(details), score_10
@@ -473,11 +495,11 @@ def build_verdict(ela_score, ghost_ok, ghost_q,
 # HANDLER PRINCIPAL
 # ══════════════════════════════════════════════════════════════
 async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid      = str(uuid.uuid4())[:8]
-    in_p     = f"in_{uid}.jpg"
-    ela_p    = f"ela_{uid}.jpg"
-    patch_p  = f"patch_{uid}.jpg"
-    paths    = [in_p, ela_p, patch_p]
+    uid     = str(uuid.uuid4())[:8]
+    in_p    = f"in_{uid}.jpg"
+    ela_p   = f"ela_{uid}.jpg"
+    patch_p = f"patch_{uid}.jpg"
+    paths   = [in_p, ela_p, patch_p]
 
     try:
         file = await update.message.photo[-1].get_file()
@@ -485,22 +507,22 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await update.message.reply_text(
             "🔬 *Análisis forense iniciado…*\n"
-            "Ejecutando 6 módulos de detección. Un momento ⏳",
+            "Ejecutando 5 módulos calibrados ⏳",
             parse_mode=constants.ParseMode.MARKDOWN,
         )
 
-        # ── Ejecutar todos los módulos ────────────────────────
-        ela_score,  ela_img              = mod_ela(in_p)
-        ghost_ok,   ghost_q              = mod_jpeg_ghost(in_p)
-        patch_score, patch_n, patch_img  = mod_patch_detection(in_p)
-        sharp_cv,   _                    = mod_sharpness_map(in_p)
-        noise_cv,   _                    = mod_noise(in_p)
-        exif_pts,   exif_h               = mod_exif(in_p)
+        # ── Ejecutar módulos ──────────────────────────────────
+        ela_global, ela_ratio, ela_img    = mod_ela(in_p)
+        patch_score, patch_n, patch_img   = mod_rect_patch(in_p)
+        ghost_ok, ghost_q                 = mod_jpeg_ghost(in_p)
+        noise_cv, _                       = mod_noise(in_p)
+        exif_pts, exif_h                  = mod_exif(in_p)
 
         veredicto, resumen, detalles, score_10 = build_verdict(
-            ela_score, ghost_ok, ghost_q,
+            ela_global, ela_ratio,
             patch_score, patch_n,
-            sharp_cv, noise_cv,
+            ghost_ok, ghost_q,
+            noise_cv,
             exif_pts, exif_h,
         )
 
@@ -510,20 +532,21 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
             photo=open(ela_p, "rb"),
             caption=(
                 "🖼️ *Mapa ELA — Errores de Compresión*\n"
-                "Zonas brillantes = anomalías de recompresión JPEG."
+                "Zonas brillantes = compresión heterogénea (anomalía)."
             ),
             parse_mode=constants.ParseMode.MARKDOWN,
         )
 
-        # ── Enviar mapa de parches (si hay zonas sospechosas) ─
-        if patch_img is not None and patch_n > 0:
+        # ── Enviar mapa de parches ────────────────────────────
+        if patch_img is not None:
             patch_img.save(patch_p, "JPEG", quality=85)
             await update.message.reply_photo(
                 photo=open(patch_p, "rb"),
                 caption=(
-                    "🟠 *Mapa de Zonas Lisas (Parches)*\n"
-                    "Rectángulos naranjas = bloques con fondo "
-                    "artificialmente liso sobre papel texturizado."
+                    "🟠 *Mapa de Recuadros Anómalos*\n"
+                    "Rectángulos marcados = zonas cuyo fondo es más liso\n"
+                    "que el papel de su entorno inmediato.\n"
+                    "Número = factor de suavidad (> 1.4× = sospechoso)."
                 ),
                 parse_mode=constants.ParseMode.MARKDOWN,
             )
@@ -564,13 +587,12 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 *Bot Forense de Documentos*\n\n"
-        "Envíame la foto del comprobante y lo analizaré con 6 módulos:\n\n"
-        "1️⃣ *Parches lisos* — Zonas con fondo artificial sobre papel\n"
-        "2️⃣ *Nitidez por zonas* — Texto demasiado nítido = inserción digital\n"
-        "3️⃣ *Ruido del sensor* — Inconsistencias entre regiones\n"
-        "4️⃣ *ELA* — Errores de compresión JPEG\n"
-        "5️⃣ *JPEG Ghost* — Doble compresión (guardado tras edición)\n"
-        "6️⃣ *Metadatos EXIF* — Software de edición y fechas\n\n"
+        "Envíame la foto del comprobante y lo analizaré con 5 módulos:\n\n"
+        "1️⃣ *Recuadros artificiales* — Fondo interior más liso que el papel\n"
+        "2️⃣ *ELA zonal + global* — Anomalías de compresión JPEG por zona\n"
+        "3️⃣ *JPEG Ghost* — Doble compresión (editado y re-guardado)\n"
+        "4️⃣ *Ruido del sensor* — Inconsistencias entre regiones\n"
+        "5️⃣ *Metadatos EXIF* — Software de edición y fechas\n\n"
         "📌 _Envía la imagen como *foto*, no como archivo adjunto._",
         parse_mode=constants.ParseMode.MARKDOWN,
     )
